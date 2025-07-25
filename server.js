@@ -141,7 +141,7 @@ async function getInfoWithRetry(videoUrl, retries = 3, delayMs = 5000) {
 import youtubedl from 'youtube-dl-exec';
 import path from 'path';
 
-const ytDlpPath = path.resolve('./bin/yt-dlp.exe');
+const ytDlpPath = path.resolve('./yt-dlp.exe');
 
 import { spawn } from 'child_process';
 
@@ -154,27 +154,57 @@ app.get('/stream/:videoId', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'no-cache');
 
-    const ytdlp = spawn('./yt-dlp', [
-      '-f', 'bestaudio[ext=webm]',
-      '-o', '-', // Output to stdout
-      url
-    ]);
+
+const ytdlp = spawn(ytDlpPath, [
+  '-f', '234/233',
+  '--extract-audio',
+  '--audio-format', 'mp3',
+  '--ffmpeg-location', 'C:\\ffmpeg\\ffmpeg-7.1.1-full_build\\bin',
+  '-o', '-',
+  url
+]);
+
+
+
+
+
+
 
     ytdlp.stdout.pipe(res);
 
-    ytdlp.stderr.on('data', (data) => {
-      console.error(`yt-dlp error: ${data}`);
+    let stderrData = '';
+
+    ytdlp.stderr.on('data', (chunk) => {
+      const data = chunk.toString();
+      stderrData += data;
+      console.error(`yt-dlp stderr: ${data}`);
+
+      if (data.includes('Signature extraction failed')) {
+        console.warn('❗ Detected signature extraction issue – YouTube may have changed their player script');
+      }
+
+      if (data.includes('Requested format is not available')) {
+        console.warn('⚠️ Requested format may be blocked. Consider listing formats via yt-dlp -F');
+      }
     });
 
     ytdlp.on('close', (code) => {
       if (code !== 0) {
-        console.error(`yt-dlp exited with code ${code}`);
-        res.end();
+        console.error(`yt-dlp process exited with code ${code}`);
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: 'Streaming error',
+            details: stderrData || 'yt-dlp exited unexpectedly'
+          });
+        }
       }
     });
+
   } catch (error) {
-    console.error('Stream error:', error);
-    res.status(500).json({ error: 'Streaming failed', details: error.message });
+    console.error('Stream endpoint error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Streaming failed', details: error.message });
+    }
   }
 });
 
@@ -185,101 +215,41 @@ app.get('/stream/:videoId', async (req, res) => {
 app.get('/download/:videoId', async (req, res) => {
   try {
     const { videoId } = req.params;
-    const { title } = req.query;
+    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    const downloadDir = path.resolve('./downloads');
+    const outputPath = path.join(downloadDir, `${videoId}.mp3`);
 
-    if (!videoId) {
-      return res.status(400).json({
-        error: 'Missing video ID',
-        details: 'Video ID is required for download'
-      });
-    }
+    // Ensure the downloads directory exists
+    fs.mkdirSync(downloadDir, { recursive: true });
 
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    
-    // Get video info with retry logic
-    const info = await retryWithBackoff(async () => {
-      return await ytdl.getInfo(videoUrl);
+    const ytdlp = spawn(ytDlpPath, [
+      '-f', '234/233',
+      '--ffmpeg-location', 'C:\\ffmpeg\\ffmpeg-7.1.1-full_build\\bin',
+      '--extract-audio',
+      '--audio-format', 'mp3',
+      '-o', outputPath,
+      url
+    ]);
+
+    ytdlp.stderr.on('data', (data) => {
+      console.error(`yt-dlp stderr: ${data}`);
     });
 
-    const audioFormat = ytdl.chooseFormat(info.formats, { 
-      quality: 'highestaudio',
-      filter: 'audioonly'
-    });
-
-    if (!audioFormat) {
-      throw new Error('No suitable audio format found');
-    }
-
-    // Set headers for file download
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${title || info.videoDetails.title || 'download'}.mp3"`);
-
-    let isErrorSent = false;
-
-    // Stream the download with increased buffer and timeout
-    const stream = ytdl(videoUrl, {
-      format: audioFormat,
-      filter: 'audioonly',
-      quality: 'highestaudio',
-      highWaterMark: 1 << 25, // 32MB buffer
-      timeout: 30000 // 30 second timeout
-    });
-
-    // Handle stream errors with retry logic
-    stream.on('error', async (error) => {
-      console.error('Download stream error:', error);
-      if (!res.headersSent && !isErrorSent) {
-        isErrorSent = true;
-        if (error.message.includes('429')) {
-          res.status(429).json({
-            error: 'Rate limit exceeded',
-            details: 'Please try again in a few minutes'
-          });
-        } else {
-          res.status(500).json({
-            error: 'Download failed',
-            details: error.message
-          });
-        }
-      }
-    });
-
-    // Pipe the stream with error handling
-    stream.pipe(res).on('error', (error) => {
-      console.error('Download pipe error:', error);
-      if (!res.headersSent && !isErrorSent) {
-        isErrorSent = true;
-        if (error.message.includes('429')) {
-          res.status(429).json({
-            error: 'Rate limit exceeded',
-            details: 'Please try again in a few minutes'
-          });
-        } else {
-          res.status(500).json({
-            error: 'Download pipe failed',
-            details: error.message
-          });
-        }
+    ytdlp.on('close', (code) => {
+      if (code === 0) {
+        return res.download(outputPath); // triggers browser download
+      } else {
+        console.error(`yt-dlp exited with code ${code}`);
+        return res.status(500).json({ error: 'Download failed' });
       }
     });
 
   } catch (error) {
     console.error('Download error:', error);
-    if (!res.headersSent) {
-      if (error.message.includes('429')) {
-        res.status(429).json({
-          error: 'Rate limit exceeded',
-          details: 'Please try again in a few minutes'
-        });
-      } else {
-        res.status(500).json({
-          error: 'Download failed',
-          details: error.message
-        });
-      }
-    }
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
+
 
 // Global error handling middleware
 app.use((err, req, res, next) => {
